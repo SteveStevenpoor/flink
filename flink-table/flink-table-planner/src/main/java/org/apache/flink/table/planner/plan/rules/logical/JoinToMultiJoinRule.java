@@ -18,12 +18,6 @@
 
 package org.apache.flink.table.planner.plan.rules.logical;
 
-import org.apache.flink.api.java.tuple.Tuple2;
-import org.apache.flink.table.api.TableException;
-import org.apache.flink.table.planner.plan.nodes.logical.FlinkLogicalJoin;
-import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalMultiJoin;
-import org.apache.flink.table.planner.plan.utils.IntervalJoinUtil;
-
 import org.apache.calcite.plan.RelOptRuleCall;
 import org.apache.calcite.plan.RelOptTable;
 import org.apache.calcite.plan.RelOptUtil;
@@ -35,6 +29,7 @@ import org.apache.calcite.rel.SingleRel;
 import org.apache.calcite.rel.core.Join;
 import org.apache.calcite.rel.core.JoinInfo;
 import org.apache.calcite.rel.core.JoinRelType;
+import org.apache.calcite.rel.core.Project;
 import org.apache.calcite.rel.logical.LogicalJoin;
 import org.apache.calcite.rel.logical.LogicalSnapshot;
 import org.apache.calcite.rel.logical.LogicalTableScan;
@@ -45,16 +40,26 @@ import org.apache.calcite.rel.rules.FilterMultiJoinMergeRule;
 import org.apache.calcite.rel.rules.MultiJoin;
 import org.apache.calcite.rel.rules.ProjectMultiJoinMergeRule;
 import org.apache.calcite.rel.rules.TransformationRule;
+import org.apache.calcite.rel.type.RelDataType;
+import org.apache.calcite.rel.type.RelDataTypeFactory;
+import org.apache.calcite.rel.type.RelDataTypeField;
 import org.apache.calcite.rex.RexBuilder;
 import org.apache.calcite.rex.RexCall;
 import org.apache.calcite.rex.RexInputRef;
 import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.rex.RexUtil;
 import org.apache.calcite.rex.RexVisitorImpl;
+import org.apache.calcite.tools.RelBuilder;
 import org.apache.calcite.tools.RelBuilderFactory;
 import org.apache.calcite.util.ImmutableBitSet;
 import org.apache.calcite.util.ImmutableIntList;
 import org.apache.calcite.util.Pair;
+import org.apache.flink.api.java.tuple.Tuple2;
+import org.apache.flink.table.api.TableException;
+import org.apache.flink.table.planner.plan.nodes.logical.FlinkLogicalJoin;
+import org.apache.flink.table.planner.plan.nodes.logical.FlinkOrderPreservingProjection;
+import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalMultiJoin;
+import org.apache.flink.table.planner.plan.utils.IntervalJoinUtil;
 import org.immutables.value.Value;
 
 import java.util.ArrayList;
@@ -171,8 +176,61 @@ public class JoinToMultiJoinRule extends RelRule<JoinToMultiJoinRule.Config>
     @Override
     public void onMatch(RelOptRuleCall call) {
         final Join origJoin = call.rel(0);
-        final RelNode left = call.rel(1);
-        final RelNode right = call.rel(2);
+        RelNode left = call.rel(1);
+        RelNode right = call.rel(2);
+
+        RelBuilder relBuilder = call.builder();
+        RexBuilder rexBuilder = relBuilder.getRexBuilder();
+        List<RexNode> newProjects = null;
+        List<String> fieldNames = null;
+
+        Project leftProject = null;
+        Project rightProject = null;
+        if (left instanceof FlinkOrderPreservingProjection) {
+            Project project = (Project) left;
+            if (!RexUtil.isIdentity(project.getProjects(), project.getInput().getRowType())) {
+                leftProject = project;
+                left = ((HepRelVertex) left.getInput(0)).getCurrentRel();
+
+                newProjects = new ArrayList<>(project.getProjects());
+                fieldNames = new ArrayList<>(project.getRowType().getFieldNames());
+                int rightSize = right.getRowType().getFieldCount();
+                int leftSize = left.getRowType().getFieldCount();
+                RelDataType rightRowType = right.getRowType();
+
+                for (int i = 0; i < rightSize; i++) {
+                    RelDataTypeField field = rightRowType.getFieldList().get(i);
+                    RexInputRef ref = rexBuilder.makeInputRef(field.getType(), leftSize + i);
+                    newProjects.add(ref);
+                    fieldNames.add(field.getName());
+                }
+            }
+        }
+
+        if (right instanceof FlinkOrderPreservingProjection) {
+            Project project = (Project) right;
+            if (!RexUtil.isIdentity(project.getProjects(), project.getInput().getRowType())) {
+                rightProject = project;
+                right = ((HepRelVertex) right.getInput(0)).getCurrentRel();
+
+                int leftSize = left.getRowType().getFieldCount();
+                RelDataType leftRowType = left.getRowType();
+                newProjects = new ArrayList<>();
+                fieldNames = new ArrayList<>();
+
+                for (int i = 0; i < leftSize; i++) {
+                    RelDataTypeField field = leftRowType.getFieldList().get(i);
+                    RexInputRef ref = rexBuilder.makeInputRef(field.getType(), i);
+                    newProjects.add(ref);
+                    fieldNames.add(field.getName());
+                }
+                newProjects.addAll(
+                        project.getProjects().stream()
+                                .map(expr -> shiftRex(expr, leftSize, rexBuilder))
+                                .collect(Collectors.toList()));
+                fieldNames.addAll(project.getRowType().getFieldNames());
+            }
+        }
 
         // inputNullGenFieldList records whether the field in originJoin is null generate field.
         List<Boolean> inputNullGenFieldList = new ArrayList<>();
@@ -188,8 +246,8 @@ public class JoinToMultiJoinRule extends RelRule<JoinToMultiJoinRule.Config>
                         left,
                         right,
                         projFieldsList,
-                        joinFieldRefCountsList,
-                        inputNullGenFieldList);
+                        joinFieldRefCountsList
+                );
 
         // Combine the join information from the left and right inputs, and include the
         // join information from the current join.
@@ -211,22 +269,121 @@ public class JoinToMultiJoinRule extends RelRule<JoinToMultiJoinRule.Config>
                         joinFieldRefCountsList);
 
         List<RexNode> newPostJoinFilters = combinePostJoinFilters(origJoin, left, right);
+        List<RexNode> joinConditions = Pair.right(joinSpecs);
+        List<JoinRelType> joinTypes = Pair.left(joinSpecs);
 
-        final RexBuilder rexBuilder = origJoin.getCluster().getRexBuilder();
-        RelNode multiJoin =
+        RelNode transformer;
+
+        if (leftProject != null) {
+            RelDataTypeFactory typeFactory = rexBuilder.getTypeFactory();
+            List<RelDataType> types =
+                    newProjects.stream().map(RexNode::getType).collect(Collectors.toList());
+            System.out.println(types);
+            System.out.println(fieldNames);
+            RelDataType newRowType = typeFactory.createStructType(types, fieldNames);
+            joinConditions = convertJoinCondition(rexBuilder, joinConditions, newProjects);
+            RelNode multiJoin =
                 new MultiJoin(
                         origJoin.getCluster(),
                         newInputs,
                         RexUtil.composeConjunction(rexBuilder, newJoinFilters),
                         origJoin.getRowType(),
                         origJoin.getJoinType() == JoinRelType.FULL,
-                        Pair.right(joinSpecs),
+                        joinConditions,
                         Pair.left(joinSpecs),
                         projFieldsList,
                         com.google.common.collect.ImmutableMap.copyOf(newJoinFieldRefCountsMap),
                         RexUtil.composeConjunction(rexBuilder, newPostJoinFilters, true));
+            System.out.println("ORIG J     :" + origJoin.getRowType());
+            System.out.println("MJ     :" + multiJoin.getRowType());
+//            System.out.println("CONSTRUCTED:   " + newRowType);
+            System.out.println("PROJ:    " + leftProject.getRowType());
+            //            RelNode multiJoin = convertToMultiJoin(origJoin, left, right);
+            //            multiJoin = convertJoinCondition(multiJoin, newProjects);
+            RelNode newProject =
+                    leftProject.copy(
+                            multiJoin.getTraitSet(),
+                            multiJoin,
+                            newProjects,
+                            origJoin.getRowType());
+            relBuilder.push(multiJoin);
+            transformer = newProject;
+        } else if (rightProject != null) {
+            RelDataTypeFactory typeFactory = rexBuilder.getTypeFactory();
+            List<RelDataType> types =
+                    newProjects.stream().map(RexNode::getType).collect(Collectors.toList());
 
-        call.transformTo(multiJoin);
+            RelDataType newRowType = typeFactory.createStructType(types, fieldNames);
+            joinConditions = convertJoinCondition(rexBuilder, joinConditions, newProjects);
+            RelNode multiJoin =
+                    new MultiJoin(
+                            origJoin.getCluster(),
+                            newInputs,
+                            RexUtil.composeConjunction(rexBuilder, newJoinFilters),
+                            origJoin.getRowType(),
+                            origJoin.getJoinType() == JoinRelType.FULL,
+                            joinConditions,
+                            Pair.left(joinSpecs),
+                            projFieldsList,
+                            com.google.common.collect.ImmutableMap.copyOf(newJoinFieldRefCountsMap),
+                            RexUtil.composeConjunction(rexBuilder, newPostJoinFilters, true));
+
+//            RelNode multiJoin = convertToMultiJoin(origJoin, left, right);
+//            multiJoin = convertJoinCondition(multiJoin, newProjects);
+            System.out.println("ORIG J     :" + origJoin.getRowType());
+            System.out.println("MJ     :" + multiJoin.getRowType());
+            System.out.println("CONSTRUCTED:   " + newRowType);
+            System.out.println("PROJ:    " + rightProject.getRowType());
+
+            RelNode newProject =
+                    rightProject.copy(multiJoin.getTraitSet(), multiJoin, newProjects, newRowType);
+            relBuilder.push(multiJoin);
+            transformer = newProject;
+        } else {
+            transformer =
+                    new MultiJoin(
+                            origJoin.getCluster(),
+                            newInputs,
+                            RexUtil.composeConjunction(rexBuilder, newJoinFilters),
+                            origJoin.getRowType(),
+                            origJoin.getJoinType() == JoinRelType.FULL,
+                            Pair.right(joinSpecs),
+                            Pair.left(joinSpecs),
+                            projFieldsList,
+                            com.google.common.collect.ImmutableMap.copyOf(newJoinFieldRefCountsMap),
+                            RexUtil.composeConjunction(rexBuilder, newPostJoinFilters, true));
+        }
+
+        call.transformTo(transformer);
+    }
+
+    private RexNode shiftRex(RexNode expr, int offset, RexBuilder rexBuilder) {
+        if (expr instanceof RexInputRef) {
+            RexInputRef ref = (RexInputRef) expr;
+            return rexBuilder.makeInputRef(ref.getType(), ref.getIndex() + offset);
+        }
+        return expr;
+    }
+
+    private List<RexNode> convertJoinCondition(RexBuilder rexBuilder, List<RexNode> joinConditions, List<RexNode> newProjections) {
+        RexCall origJoinCondition = (RexCall) joinConditions.get(joinConditions.size() - 1);
+        List<RexNode> newOperands = new ArrayList<>();
+
+        for (RexNode operand : origJoinCondition.operands) {
+            if (operand instanceof RexInputRef) {
+                RexInputRef inputRef = (RexInputRef) operand;
+                RexNode projectedExpr = newProjections.get(inputRef.getIndex());
+                newOperands.add(projectedExpr);
+            } else {
+                newOperands.add(operand);
+            }
+        }
+
+        List<RexNode> result = new ArrayList<>(joinConditions);
+        result.set(
+                joinConditions.size() - 1,
+                rexBuilder.makeCall(origJoinCondition.getOperator(), newOperands));
+        return result;
     }
 
     private void buildInputNullGenFieldList(
@@ -290,6 +447,7 @@ public class JoinToMultiJoinRule extends RelRule<JoinToMultiJoinRule.Config>
      * @param right right input into join
      * @param projFieldsList returns a list of the new combined projection fields
      * @param joinFieldRefCountsList returns a list of the new combined join field reference counts
+     *
      * @return combined left and right inputs in an array
      */
     private List<RelNode> combineInputs(
@@ -297,45 +455,35 @@ public class JoinToMultiJoinRule extends RelRule<JoinToMultiJoinRule.Config>
             RelNode left,
             RelNode right,
             List<ImmutableBitSet> projFieldsList,
-            List<int[]> joinFieldRefCountsList,
-            List<Boolean> inputNullGenFieldList) {
+            List<int[]> joinFieldRefCountsList) {
         final List<RelNode> newInputs = new ArrayList<>();
-        // Leave the null generating sides of an outer join intact; don't pull up those children
-        // inputs into the array we're constructing.
-        JoinInfo joinInfo = join.analyzeCondition();
-        ImmutableIntList leftKeys = joinInfo.leftKeys;
-        ImmutableIntList rightKeys = joinInfo.rightKeys;
 
-        if (canCombine(left, join)) {
-            final MultiJoin leftMultiJoin = (MultiJoin) left;
-            for (int i = 0; i < leftMultiJoin.getInputs().size(); i++) {
-                newInputs.add(leftMultiJoin.getInput(i));
-                projFieldsList.add(leftMultiJoin.getProjFields().get(i));
-                joinFieldRefCountsList.add(
-                        leftMultiJoin.getJoinFieldRefCountsMap().get(i).toIntArray());
-            }
-
-        } else {
-            newInputs.add(left);
-            projFieldsList.add(null);
-            joinFieldRefCountsList.add(new int[left.getRowType().getFieldCount()]);
-        }
-
-        if (canCombine(right, join)) {
-            final MultiJoin rightMultiJoin = (MultiJoin) right;
-            for (int i = 0; i < rightMultiJoin.getInputs().size(); i++) {
-                newInputs.add(rightMultiJoin.getInput(i));
-                projFieldsList.add(rightMultiJoin.getProjFields().get(i));
-                joinFieldRefCountsList.add(
-                        rightMultiJoin.getJoinFieldRefCountsMap().get(i).toIntArray());
-            }
-        } else {
-            newInputs.add(right);
-            projFieldsList.add(null);
-            joinFieldRefCountsList.add(new int[right.getRowType().getFieldCount()]);
-        }
+        combineInputs(join, left, newInputs, projFieldsList, joinFieldRefCountsList);
+        combineInputs(join, right, newInputs, projFieldsList, joinFieldRefCountsList);
 
         return newInputs;
+    }
+
+    private void combineInputs(
+            Join join,
+            RelNode child,
+            List<RelNode> newInputs,
+            List<ImmutableBitSet> projFieldsList,
+            List<int[]> joinFieldRefCountsList) {
+        if (canCombine(child, join)) {
+            final MultiJoin childMultiJoin = (MultiJoin) child;
+            for (int i = 0; i < childMultiJoin.getInputs().size(); i++) {
+                newInputs.add(childMultiJoin.getInput(i));
+                projFieldsList.add(childMultiJoin.getProjFields().get(i));
+                joinFieldRefCountsList.add(
+                        childMultiJoin.getJoinFieldRefCountsMap().get(i).toIntArray());
+            }
+
+        } else {
+            newInputs.add(child);
+            projFieldsList.add(null);
+            joinFieldRefCountsList.add(new int[child.getRowType().getFieldCount()]);
+        }
     }
 
     /**
@@ -362,18 +510,19 @@ public class JoinToMultiJoinRule extends RelRule<JoinToMultiJoinRule.Config>
         ImmutableIntList leftKeys = joinInfo.leftKeys;
         final RexBuilder rexBuilder = joinRel.getCluster().getRexBuilder();
         boolean leftCombined = canCombine(left, joinRel);
+        boolean rightCombined = canCombine(right, joinRel);
         switch (joinType) {
             case LEFT:
-                if (leftCombined) {
-                    copyJoinInfo((MultiJoin) left, joinSpecs);
-                } else {
-                    joinSpecs.add(Pair.of(JoinRelType.INNER, rexBuilder.makeLiteral(true)));
-                }
-                joinSpecs.add(Pair.of(joinType, joinRel.getCondition()));
-                break;
             case INNER:
                 if (leftCombined) {
-                    copyJoinInfo((MultiJoin) left, joinSpecs);
+                    copyJoinInfo((MultiJoin) left, joinSpecs, 0, null, null);
+                } else if (rightCombined) {
+                    copyJoinInfo(
+                            (MultiJoin) right,
+                            joinSpecs,
+                            left.getRowType().getFieldCount(),
+                            right.getRowType().getFieldList(),
+                            joinRel.getRowType().getFieldList());
                 } else {
                     joinSpecs.add(Pair.of(JoinRelType.INNER, rexBuilder.makeLiteral(true)));
                 }
@@ -393,12 +542,40 @@ public class JoinToMultiJoinRule extends RelRule<JoinToMultiJoinRule.Config>
      * @param multiJoin the source MultiJoin
      * @param destJoinSpecs the list where the join types and conditions will be copied
      */
-    private void copyJoinInfo(MultiJoin multiJoin, List<Pair<JoinRelType, RexNode>> destJoinSpecs) {
-        // getOuterJoinConditions are return all join conditions since that's how we use it
+    private void copyJoinInfo(
+            MultiJoin multiJoin,
+            List<Pair<JoinRelType, RexNode>> destJoinSpecs,
+            int adjustmentAmount,
+            List<RelDataTypeField> srcFields,
+            List<RelDataTypeField> destFields) {
+
         final List<Pair<JoinRelType, RexNode>> srcJoinSpecs =
                 Pair.zip(multiJoin.getJoinTypes(), multiJoin.getOuterJoinConditions());
 
-        destJoinSpecs.addAll(srcJoinSpecs);
+        if (adjustmentAmount == 0) {
+            destJoinSpecs.addAll(srcJoinSpecs);
+        } else {
+            assert srcFields != null;
+            assert destFields != null;
+            int nFields = srcFields.size();
+            int[] adjustments = new int[nFields];
+            for (int idx = 0; idx < nFields; idx++) {
+                adjustments[idx] = adjustmentAmount;
+            }
+            for (Pair<JoinRelType, RexNode> src : srcJoinSpecs) {
+                destJoinSpecs.add(
+                        Pair.of(
+                                src.left,
+                                src.right == null
+                                        ? null
+                                        : src.right.accept(
+                                        new RelOptUtil.RexInputConverter(
+                                                multiJoin.getCluster().getRexBuilder(),
+                                                srcFields,
+                                                destFields,
+                                                adjustments))));
+            }
+        }
     }
 
     /**
@@ -445,6 +622,17 @@ public class JoinToMultiJoinRule extends RelRule<JoinToMultiJoinRule.Config>
      * @return true if the input can be combined into a parent MultiJoin
      */
     private boolean canCombine(RelNode input, Join origJoin) {
+        if (input instanceof FlinkOrderPreservingProjection) {
+            FlinkOrderPreservingProjection project = (FlinkOrderPreservingProjection) input;
+            while (project.getInput() instanceof FlinkOrderPreservingProjection) {
+                project = (FlinkOrderPreservingProjection) project.getInput();
+            }
+            input =
+                    (input.getInput(0) instanceof HepRelVertex)
+                            ? ((HepRelVertex) input.getInput(0)).getCurrentRel()
+                            : input.getInput(0);
+        }
+
         if (input instanceof MultiJoin) {
             MultiJoin join = (MultiJoin) input;
 

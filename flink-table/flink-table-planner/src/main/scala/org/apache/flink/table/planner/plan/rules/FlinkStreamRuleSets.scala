@@ -17,17 +17,15 @@
  */
 package org.apache.flink.table.planner.plan.rules
 
-import org.apache.flink.table.planner.plan.nodes.logical._
-import org.apache.flink.table.planner.plan.nodes.physical.stream.{StreamPhysicalMLPredictTableFunctionRule, StreamPhysicalProcessTableFunctionRule}
-import org.apache.flink.table.planner.plan.rules.logical._
-import org.apache.flink.table.planner.plan.rules.logical.JoinToMultiJoinRule
-import org.apache.flink.table.planner.plan.rules.physical.FlinkExpandConversionRule
-import org.apache.flink.table.planner.plan.rules.physical.stream._
-
 import org.apache.calcite.rel.core.RelFactories
 import org.apache.calcite.rel.logical.{LogicalIntersect, LogicalMinus, LogicalUnion}
 import org.apache.calcite.rel.rules._
 import org.apache.calcite.tools.{RuleSet, RuleSets}
+import org.apache.flink.table.planner.plan.nodes.logical._
+import org.apache.flink.table.planner.plan.nodes.physical.stream.{StreamPhysicalMLPredictTableFunctionRule, StreamPhysicalProcessTableFunctionRule}
+import org.apache.flink.table.planner.plan.rules.logical.{JoinToMultiJoinRule, _}
+import org.apache.flink.table.planner.plan.rules.physical.FlinkExpandConversionRule
+import org.apache.flink.table.planner.plan.rules.physical.stream._
 
 import scala.collection.JavaConverters._
 
@@ -134,7 +132,7 @@ object FlinkStreamRuleSets {
           // Wrap arguments for JSON aggregate functions
           WrapJsonAggFunctionArgumentsRule.INSTANCE
         )
-    ).asJava)
+      ).asJava)
 
   /** RuleSet about filter */
   private val FILTER_RULES: RuleSet = RuleSets.ofList(
@@ -159,11 +157,11 @@ object FlinkStreamRuleSets {
   val FILTER_PREPARE_RULES: RuleSet = RuleSets.ofList(
     (
       FILTER_RULES.asScala
-      // simplify predicate expressions in filters and joins
+        // simplify predicate expressions in filters and joins
         ++ PREDICATE_SIMPLIFY_EXPRESSION_RULES.asScala
         // reduce expressions in filters and joins
         ++ REDUCE_EXPRESSION_RULES.asScala
-    ).asJava)
+      ).asJava)
 
   /** RuleSet to push down partitions into table source */
   val PUSH_PARTITION_DOWN_RULES: RuleSet = RuleSets.ofList(
@@ -231,12 +229,16 @@ object FlinkStreamRuleSets {
   )
 
   val MULTI_JOIN_RULES: RuleSet = RuleSets.ofList(
+    // convert right joins to the left ones
+    FlinkRightJoinToLeftJoinRule.INSTANCE,
     // merge project to MultiJoin
     CoreRules.PROJECT_MULTI_JOIN_MERGE,
     // merge filter to MultiJoin
     CoreRules.FILTER_MULTI_JOIN_MERGE,
     // merge join to MultiJoin
-    JoinToMultiJoinRule.INSTANCE
+    JoinToMultiJoinRule.INSTANCE,
+    // remove conflicting projections
+    FlinkOrderPreservingProjectRemoveRule.INSTANCE
   )
 
   /** RuleSet to do logical optimize. This RuleSet is a sub-set of [[LOGICAL_OPT_RULES]]. */
@@ -347,7 +349,7 @@ object FlinkStreamRuleSets {
         PRUNE_EMPTY_RULES.asScala ++
         LOGICAL_RULES.asScala ++
         LOGICAL_CONVERTERS.asScala
-    ).asJava)
+      ).asJava)
 
   /** RuleSet to do rewrite on FlinkLogicalRel for Stream */
   val LOGICAL_REWRITE: RuleSet = RuleSets.ofList(
