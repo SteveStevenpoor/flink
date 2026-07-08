@@ -569,6 +569,71 @@ class SourceOperatorSplitWatermarkAlignmentTest {
                 0L, operator.getSplitMetricGroup(split0.splitId()).getAccumulatedPausedTime());
     }
 
+    @Test
+    void testPausedSplitDoesNotGetStuckWhenMarkedIdleDuringPause() throws Exception {
+        final long idleTimeout = 10000;
+
+        final RaceInjectingMockSourceReader sourceReader =
+                new RaceInjectingMockSourceReader(
+                        WaitingForSplits.DO_NOT_WAIT_FOR_SPLITS, false, true);
+
+        final TestProcessingTimeService processingTimeService = new TestProcessingTimeService();
+        processingTimeService.setCurrentTime(0);
+
+        final SourceOperator operator =
+                createAndOpenSourceOperatorWithIdleness(
+                        sourceReader, processingTimeService, idleTimeout);
+
+        final MockSourceSplit split0 = new MockSourceSplit(0, 0, 10);
+        final MockSourceSplit split1 = new MockSourceSplit(1, 10, 20);
+
+        // split0 will become ahead and get paused
+        split0.addRecord(5);
+
+        // split1 is the slower split
+        split1.addRecord(0);
+
+        operator.handleOperatorEvent(
+                new AddSplitEvent<>(
+                        Arrays.asList(split0, split1), new MockSourceSplitSerializer()));
+
+        final CollectingDataOutput actualOutput = new CollectingDataOutput<>();
+
+        operator.emitNext(actualOutput); // split0 emits 5
+        operator.emitNext(actualOutput); // split1 emits 0
+        sampleAllWatermarks(processingTimeService);
+
+        // Inject the race:
+        //
+        // SourceOperator.pauseOrResumeSplits does:
+        //   1. sourceReader.pauseOrResumeSplits(...)
+        //   2. eventTimeLogic.pauseOrResumeSplits(...)
+        //
+        // We simulate the idleness timer firing between those two calls
+        sourceReader.runAfterNextPause(
+                () -> operator.updateCurrentSplitIdle(split0.splitId(), true));
+
+        operator.handleOperatorEvent(new WatermarkAlignmentEvent(4));
+
+        assertThat(sourceReader.getPausedSplits()).containsExactly(split0.splitId());
+
+        // Now the slow split catches up. This should make split0 resumable
+        sourceReader.getAssignedSplits().get(1).addRecord(4);
+        operator.emitNext(actualOutput); // split1 emits 4
+        sampleAllWatermarks(processingTimeService);
+
+        operator.handleOperatorEvent(new WatermarkAlignmentEvent(5));
+
+        // Assert split0 resumed after the first alignment is done
+        assertThat(sourceReader.getPausedSplits()).doesNotContain(split0.splitId());
+
+        // Verify that the split can emit again
+        sourceReader.getAssignedSplits().get(0).addRecord(6);
+        operator.emitNext(actualOutput);
+
+        assertOutput(actualOutput, Arrays.asList(5, 0, 4, 6));
+    }
+
     private void sampleAllWatermarks(TestProcessingTimeService timeService) throws Exception {
         sampleWatermarks(timeService, WATERMARK_ALIGNMENT_BUFFER_SIZE.defaultValue());
     }
@@ -695,6 +760,33 @@ class SourceOperatorSplitWatermarkAlignmentTest {
         @Override
         public void onPeriodicEmit(WatermarkOutput output) {
             output.emitWatermark(new Watermark(maxWatermark));
+        }
+    }
+
+    private static class RaceInjectingMockSourceReader extends MockSourceReader {
+        private Runnable afterNextPause = () -> {};
+
+        RaceInjectingMockSourceReader(
+                WaitingForSplits waitingForSplitsBehaviour,
+                boolean markIdleOnNoSplits,
+                boolean usePerSplitOutputs) {
+            super(waitingForSplitsBehaviour, markIdleOnNoSplits, usePerSplitOutputs);
+        }
+
+        void runAfterNextPause(Runnable afterNextPause) {
+            this.afterNextPause = afterNextPause;
+        }
+
+        @Override
+        public void pauseOrResumeSplits(
+                Collection<String> splitsToPause, Collection<String> splitsToResume) {
+            super.pauseOrResumeSplits(splitsToPause, splitsToResume);
+
+            if (!splitsToPause.isEmpty()) {
+                Runnable callback = afterNextPause;
+                afterNextPause = () -> {};
+                callback.run();
+            }
         }
     }
 

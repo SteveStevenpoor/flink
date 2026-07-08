@@ -889,11 +889,17 @@ public class SourceOperator<OUT, SplitT extends SourceSplit> extends AbstractStr
 
     private void reportPausedOrResumed(
             Collection<String> splitsToPause, Collection<String> splitsToResume) {
+        InternalSourceSplitMetricGroup metricGroup;
         for (String splitId : splitsToResume) {
-            getOrCreateSplitMetricGroup(splitId).markNotPaused();
+            metricGroup = getOrCreateSplitMetricGroup(splitId);
+            metricGroup.markNotPaused();
         }
         for (String splitId : splitsToPause) {
-            getOrCreateSplitMetricGroup(splitId).markPaused();
+            metricGroup = getOrCreateSplitMetricGroup(splitId);
+            if (metricGroup.isIdle()) {
+                currentlyIdleSplits.remove(splitId);
+            }
+            metricGroup.markPaused();
         }
     }
 
